@@ -1,48 +1,104 @@
 /**
  * controllers/teacherAttendanceController.js
- * --------------------------------------------
+ *
  * Controller untuk manajemen kehadiran siswa oleh wali kelas.
+ * Setiap wali kelas hanya dapat mengakses kehadiran di kelas yang menjadi
+ * tanggung jawabnya pada tahun ajaran/semester aktif.
  *
- * Setiap wali kelas hanya dapat mengakses kehadiran di kelas yang
- * menjadi tanggung jawabnya pada tahun ajaran/semester aktif.
+ * ============================================================
+ * ENDPOINTS
+ * ============================================================
+ * GET    /teachers/attendances/rekap   → daftar tanggal yang sudah ada rekapnya
+ * GET    /teachers/attendances?date=   → data kehadiran siswa per tanggal
+ * POST   /teachers/attendances         → buat sesi kehadiran untuk tanggal baru
+ * PUT    /teachers/attendances?date=   → update status kehadiran per siswa
+ * DELETE /teachers/attendances?date=   → hapus seluruh kehadiran di suatu tanggal
  *
- * Endpoints yang dilayani:
- *  - GET    /teachers/attendances/rekap   → Daftar tanggal yang sudah ada rekapnya
- *  - GET    /teachers/attendances         → Data kehadiran siswa per tanggal
- *  - POST   /teachers/attendances         → Buat sesi kehadiran untuk tanggal baru
- *  - PUT    /teachers/attendances         → Update status kehadiran per siswa
- *  - DELETE /teachers/attendances         → Hapus seluruh kehadiran di suatu tanggal
+ * ============================================================
+ * PANDUAN MAINTENANCE
+ * ============================================================
+ * - Gunakan helper validateDateParam() untuk semua endpoint yang menerima date.
+ * - Rekap endpoint menggunakan `req.activeSemester` dari middleware loadActiveSemester.
+ * - DELETE endpoint harus melewati validasi yang sama dengan GET/PUT.
+ * - Whitelist status kehadiran: ['Hadir', 'Izin', 'Sakit', 'Alpa', 'Not Set'].
+ * - Batasi jumlah update per request (default 100) untuk mencegah overload.
  *
- * @module controllers/teacherAttendanceController
+ * @module teacherAttendanceController
  */
 
-const { Op }          = require('sequelize');
-const { sequelize, Class, AcademicYear, Semester, Student, StudentClass, Attendance } = require('../models');
+// ============================================================
+// Dependencies
+// ============================================================
+const { Op } = require('sequelize');
+const {
+  sequelize,
+  Class,
+  AcademicYear,
+  StudentClass,
+  Student,
+  Attendance,
+} = require('../models');
 
-// ── Helper ────────────────────────────────────────────────────────────────────
+// ============================================================
+// Constants
+// ============================================================
+
+/** Status kehadiran yang diizinkan */
+const VALID_ATTENDANCE_STATUS = ['Hadir', 'Izin', 'Sakit', 'Alpa', 'Not Set'];
+
+/** Regex format tanggal YYYY-MM-DD */
+const DATE_FORMAT_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Batas maksimum update kehadiran per request */
+const MAX_ATTENDANCE_UPDATES = 100;
+
+// ============================================================
+// Helper Functions
+// ============================================================
 
 /**
- * Cari kelas yang dikelola wali kelas pada tahun ajaran tertentu.
- * Mengembalikan null jika wali kelas tidak memiliki kelas di tahun ajaran tsb.
+ * Mendapatkan kelas yang dikelola wali kelas pada tahun ajaran tertentu.
  *
- * @param {number} teacherId
- * @param {number} academicYearId
+ * @param {string} teacherId - ID user wali kelas (req.user.id)
+ * @param {number} academicYearId - ID tahun ajaran aktif
  * @returns {Promise<Class|null>}
  */
 async function getTeacherClass(teacherId, academicYearId) {
   return Class.findOne({
     where: { teacher_id: teacherId, academic_year_id: academicYearId },
+    attributes: ['id', 'name'],
   });
 }
 
-// ── Rekap tanggal kehadiran ───────────────────────────────────────────────────
+/**
+ * Validasi format dan keabsahan tanggal.
+ *
+ * @param {string|undefined} date - Nilai tanggal yang akan divalidasi
+ * @returns {{ valid: boolean, message?: string }}
+ */
+function validateDateParam(date) {
+  if (!date) {
+    return { valid: false, message: 'Parameter tanggal wajib diisi' };
+  }
+  if (!DATE_FORMAT_REGEX.test(date)) {
+    return { valid: false, message: 'Format tanggal tidak valid. Gunakan format YYYY-MM-DD.' };
+  }
+  if (isNaN(Date.parse(date))) {
+    return { valid: false, message: 'Tanggal tidak valid (misal: bulan atau hari di luar jangkauan).' };
+  }
+  return { valid: true };
+}
+
+// ============================================================
+// Controllers
+// ============================================================
 
 /**
  * GET /teachers/attendances/rekap
- * Daftar tanggal unik yang sudah memiliki data kehadiran di semester aktif.
- * Berguna untuk menampilkan daftar tanggal yang bisa diedit.
  *
- * @param {import('express').Request}  req - req.activeSemester diisi oleh loadActiveSemester
+ * Daftar tanggal unik yang sudah memiliki data kehadiran di semester aktif.
+ *
+ * @param {import('express').Request} req - req.activeSemester dari middleware loadActiveSemester
  * @param {import('express').Response} res
  */
 exports.getAttendanceRekap = async (req, res) => {
@@ -54,56 +110,62 @@ exports.getAttendanceRekap = async (req, res) => {
       return res.status(404).json({ message: 'Anda tidak mengelola kelas di semester aktif' });
     }
 
-    // Kumpulkan semua student_class_id di kelas ini
     const studentClasses = await StudentClass.findAll({
-      where:      { class_id: classData.id },
+      where: { class_id: classData.id },
       attributes: ['id'],
     });
 
-    const studentClassIds = studentClasses.map((sc) => sc.id);
-    if (studentClassIds.length === 0) {
-      return res.status(404).json({ message: 'Tidak ada siswa di kelas ini' });
+    if (!studentClasses.length) {
+      return res.json({
+        semester_id: activeSemester.id,
+        class_id: classData.id,
+        class_name: classData.name,
+        total_dates: 0,
+        dates: [],
+      });
     }
 
-    // Ambil tanggal unik yang sudah ada data kehadirannya
+    const studentClassIds = studentClasses.map(sc => sc.id);
+
     const dates = await Attendance.findAll({
       where: {
-        semester_id:      activeSemester.id,
+        semester_id: activeSemester.id,
         student_class_id: { [Op.in]: studentClassIds },
       },
       attributes: [[sequelize.fn('DISTINCT', sequelize.col('date')), 'date']],
-      order:      [['date', 'DESC']],
-      raw:        true,
+      order: [['date', 'DESC']],
+      raw: true,
     });
 
     return res.json({
-      semester_id:  activeSemester.id,
-      class_id:     classData.id,
-      total_dates:  dates.length,
-      dates:        dates.map((d) => d.date),
+      semester_id: activeSemester.id,
+      class_id: classData.id,
+      class_name: classData.name,
+      total_dates: dates.length,
+      dates: dates.map(d => d.date),
     });
   } catch (error) {
     console.error('[attendance/rekap] Error:', error);
-    return res.status(500).json({ message: 'Gagal mengambil rekapan tanggal kehadiran', error: error.message });
+    return res.status(500).json({ message: 'Gagal mengambil rekap tanggal kehadiran' });
   }
 };
 
-// ── Ambil kehadiran per tanggal ───────────────────────────────────────────────
-
 /**
- * GET /teachers/attendances?date=YYYY-MM-DD
+ * GET /teachers/attendances
+ *
  * Data kehadiran seluruh siswa pada tanggal tertentu.
  *
- * @param {import('express').Request}  req - Query param: date (required)
+ * @param {import('express').Request} req - Query: { date }
  * @param {import('express').Response} res
  */
 exports.getAttendances = async (req, res) => {
   try {
-    const { date }       = req.query;
+    const { date } = req.query;
     const activeSemester = req.activeSemester;
 
-    if (!date) {
-      return res.status(400).json({ message: 'Query parameter "date" wajib diisi' });
+    const validation = validateDateParam(date);
+    if (!validation.valid) {
+      return res.status(400).json({ message: validation.message });
     }
 
     const classData = await getTeacherClass(req.user.id, activeSemester.academic_year_id);
@@ -115,189 +177,192 @@ exports.getAttendances = async (req, res) => {
       where: { semester_id: activeSemester.id, date },
       include: [{
         model: StudentClass,
-        as:    'student_class',
+        as: 'student_class',
         where: { class_id: classData.id },
         include: [{
-          model:      Student,
-          as:         'student',
+          model: Student,
+          as: 'student',
           attributes: ['id', 'name'],
         }],
       }],
       attributes: ['id', 'student_class_id', 'status', 'date'],
     });
 
-    if (attendances.length === 0) {
+    if (!attendances.length) {
       return res.status(404).json({ message: 'Belum ada data kehadiran untuk tanggal tersebut' });
     }
 
-    // Format dan urutkan berdasarkan nama siswa
     const result = attendances
-      .map((att) => ({
-        attendance_id:    att.id,
+      .map(att => ({
+        attendance_id: att.id,
         student_class_id: att.student_class_id,
-        student_name:     att.student_class.student.name,
-        status:           att.status,
-        date:             att.date,
+        student_name: att.student_class?.student?.name ?? null,
+        status: att.status,
+        date: att.date,
       }))
-      .sort((a, b) => a.student_name.localeCompare(b.student_name));
+      .sort((a, b) => (a.student_name ?? '').localeCompare(b.student_name ?? ''));
 
     return res.json(result);
   } catch (error) {
     console.error('[attendance/get] Error:', error);
-    return res.status(500).json({ message: 'Gagal mengambil data kehadiran', error: error.message });
+    return res.status(500).json({ message: 'Gagal mengambil data kehadiran' });
   }
 };
 
-// ── Buat sesi kehadiran ───────────────────────────────────────────────────────
-
 /**
  * POST /teachers/attendances
- * Membuat record kehadiran (status "Not Set") untuk semua siswa di kelas
- * pada tanggal yang diberikan. Harus dilakukan sebelum mengisi status kehadiran.
  *
- * @param {import('express').Request}  req - Body: { date: 'YYYY-MM-DD' }
+ * Membuat sesi kehadiran (status 'Not Set') untuk semua siswa di kelas pada tanggal yang diberikan.
+ *
+ * @param {import('express').Request} req - Body: { date }
  * @param {import('express').Response} res
  */
 exports.createAttendance = async (req, res) => {
   const t = await sequelize.transaction();
-
   try {
-    const { date }       = req.body;
+    const { date } = req.body;
     const activeSemester = req.activeSemester;
 
-    if (!date) {
+    const validation = validateDateParam(date);
+    if (!validation.valid) {
       await t.rollback();
-      return res.status(400).json({ message: 'Field "date" wajib diisi' });
+      return res.status(400).json({ message: validation.message });
     }
 
-    const activeYear = await AcademicYear.findOne({ where: { is_active: true } });
-    if (!activeYear) {
+    const classData = await getTeacherClass(req.user.id, activeSemester.academic_year_id);
+    if (!classData) {
       await t.rollback();
-      return res.status(404).json({ message: 'Tahun ajaran aktif tidak ditemukan' });
-    }
-
-    const myClass = await getTeacherClass(req.user.id, activeYear.id);
-    if (!myClass) {
-      await t.rollback();
-      return res.status(404).json({ message: 'Anda tidak mengelola kelas di tahun ajaran aktif' });
+      return res.status(404).json({ message: 'Anda tidak mengelola kelas di semester aktif' });
     }
 
     const studentClasses = await StudentClass.findAll({
-      where:      { class_id: myClass.id },
+      where: { class_id: classData.id },
       attributes: ['id'],
+      transaction: t,
     });
 
     if (!studentClasses.length) {
       await t.rollback();
-      return res.status(404).json({ message: 'Tidak ada siswa di kelas ini' });
+      return res.status(404).json({ message: 'Tidak ada siswa terdaftar di kelas ini' });
     }
 
-    const studentClassIds = studentClasses.map((sc) => sc.id);
+    const studentClassIds = studentClasses.map(sc => sc.id);
 
-    // Cek apakah kehadiran untuk tanggal ini sudah ada
     const existing = await Attendance.findOne({
       where: {
-        semester_id:      activeSemester.id,
+        semester_id: activeSemester.id,
         date,
         student_class_id: { [Op.in]: studentClassIds },
       },
+      transaction: t,
     });
 
     if (existing) {
       await t.rollback();
-      return res.status(400).json({ message: 'Kehadiran untuk tanggal ini sudah ada' });
+      return res.status(409).json({
+        message: `Sesi kehadiran untuk tanggal ${date} sudah ada. Gunakan PUT untuk mengubah status kehadiran.`,
+      });
     }
 
-    // Buat record kehadiran default "Not Set" untuk semua siswa
-    const records = studentClassIds.map((id) => ({
+    const records = studentClassIds.map(id => ({
       student_class_id: id,
-      semester_id:      activeSemester.id,
+      semester_id: activeSemester.id,
       date,
-      status:           'Not Set',
+      status: 'Not Set',
     }));
 
     await Attendance.bulkCreate(records, { transaction: t });
     await t.commit();
 
-    return res.status(201).json({ message: 'Sesi kehadiran berhasil dibuat untuk semua siswa' });
+    return res.status(201).json({
+      message: `Sesi kehadiran berhasil dibuat untuk ${studentClassIds.length} siswa`,
+      date,
+      total_students: studentClassIds.length,
+    });
   } catch (error) {
-    // Rollback jika terjadi error apa pun
     await t.rollback();
     console.error('[attendance/create] Error:', error);
-    return res.status(500).json({ message: 'Gagal membuat sesi kehadiran', error: error.message });
+    return res.status(500).json({ message: 'Gagal membuat sesi kehadiran' });
   }
 };
 
-// ── Update status kehadiran ───────────────────────────────────────────────────
-
 /**
- * PUT /teachers/attendances?date=YYYY-MM-DD
- * Update status kehadiran (Hadir/Sakit/Izin/Alpa/Not Set) per siswa.
+ * PUT /teachers/attendances
  *
- * @param {import('express').Request}  req - Query: date. Body: { attendanceUpdates: [{student_class_id, status}] }
+ * Update status kehadiran (Hadir/Sakit/Izin/Alpa/Not Set) per siswa.
+ * Menggunakan bulk fetch + parallel update untuk efisiensi.
+ *
+ * @param {import('express').Request} req - Query: { date }, Body: { attendanceUpdates: [{ student_class_id, status }] }
  * @param {import('express').Response} res
  */
 exports.updateAttendances = async (req, res) => {
   try {
-    const { date }              = req.query;
+    const { date } = req.query;
     const { attendanceUpdates } = req.body;
-    const activeSemester        = req.activeSemester;
+    const activeSemester = req.activeSemester;
 
-    // ── Validasi input ──────────────────────────────────────────────────────
-    if (!date) {
-      return res.status(400).json({ message: 'Query parameter "date" wajib diisi' });
-    }
-
-    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
-    if (!dateRegex.test(date) || isNaN(Date.parse(date))) {
-      return res.status(400).json({ message: 'Format tanggal tidak valid (gunakan YYYY-MM-DD)' });
+    const dateValidation = validateDateParam(date);
+    if (!dateValidation.valid) {
+      return res.status(400).json({ message: dateValidation.message });
     }
 
     if (!Array.isArray(attendanceUpdates) || attendanceUpdates.length === 0) {
-      return res.status(400).json({ message: 'Body "attendanceUpdates" harus berupa array yang tidak kosong' });
+      return res.status(400).json({
+        message: 'Field "attendanceUpdates" harus berupa array yang tidak kosong',
+      });
+    }
+    if (attendanceUpdates.length > MAX_ATTENDANCE_UPDATES) {
+      return res.status(400).json({
+        message: `Maksimal ${MAX_ATTENDANCE_UPDATES} update kehadiran per request`,
+      });
     }
 
-    // ── Cari kelas wali kelas ───────────────────────────────────────────────
+    const invalidItems = attendanceUpdates.filter(u => !VALID_ATTENDANCE_STATUS.includes(u.status));
+    if (invalidItems.length > 0) {
+      return res.status(400).json({
+        message: `Status tidak valid. Nilai yang diizinkan: ${VALID_ATTENDANCE_STATUS.join(', ')}`,
+        invalid: invalidItems.map(u => ({ student_class_id: u.student_class_id, status: u.status })),
+      });
+    }
+
     const classData = await getTeacherClass(req.user.id, activeSemester.academic_year_id);
     if (!classData) {
       return res.status(404).json({ message: 'Kelas tidak ditemukan untuk wali kelas ini' });
     }
 
-    // Validasi bahwa semua student_class_id yang dikirim memang ada di kelas ini
     const studentClasses = await StudentClass.findAll({
-      where:      { class_id: classData.id },
+      where: { class_id: classData.id },
       attributes: ['id'],
     });
-    const validIds  = new Set(studentClasses.map((sc) => sc.id));
-    const invalidIds = attendanceUpdates.filter((u) => !validIds.has(u.student_class_id));
+    const validIdSet = new Set(studentClasses.map(sc => sc.id));
 
-    if (invalidIds.length > 0) {
-      return res.status(400).json({
+    const unauthorizedItems = attendanceUpdates.filter(u => !validIdSet.has(u.student_class_id));
+    if (unauthorizedItems.length > 0) {
+      return res.status(403).json({
         message: 'Beberapa student_class_id tidak valid atau bukan milik kelas Anda',
-        invalid: invalidIds,
+        invalid: unauthorizedItems.map(u => u.student_class_id),
       });
     }
 
-    // ── Ambil semua record kehadiran sekaligus (1 query, hindari N+1) ───────
+    const requestedIds = attendanceUpdates.map(u => u.student_class_id);
     const existingAttendances = await Attendance.findAll({
       where: {
-        student_class_id: { [Op.in]: [...validIds] },
-        semester_id:      activeSemester.id,
+        student_class_id: { [Op.in]: requestedIds },
+        semester_id: activeSemester.id,
         date,
       },
     });
 
-    const attendanceByStudentClassId = {};
+    const attendanceMap = {};
     for (const att of existingAttendances) {
-      attendanceByStudentClassId[att.student_class_id] = att;
+      attendanceMap[att.student_class_id] = att;
     }
 
-    // ── Update masing-masing record ─────────────────────────────────────────
     const updatePromises = [];
-    const notFound       = [];
+    const notFound = [];
 
     for (const update of attendanceUpdates) {
-      const att = attendanceByStudentClassId[update.student_class_id];
+      const att = attendanceMap[update.student_class_id];
       if (att) {
         att.status = update.status;
         updatePromises.push(att.save());
@@ -307,74 +372,84 @@ exports.updateAttendances = async (req, res) => {
     }
 
     await Promise.all(updatePromises);
-
     const updatedCount = updatePromises.length;
 
-    // Semua tidak ditemukan → kemungkinan tanggal belum dibuat
     if (updatedCount === 0) {
-      return res.status(400).json({
-        message:                  'Tanggal kehadiran belum dibuat. Buat sesi kehadiran terlebih dahulu.',
-        notFoundStudentClassIds:  notFound,
+      return res.status(404).json({
+        message: `Belum ada sesi kehadiran untuk tanggal ${date}. Buat sesi terlebih dahulu via POST /teachers/attendances.`,
+        notFoundStudentClassIds: notFound,
       });
     }
 
     const statusCode = notFound.length > 0 ? 206 : 200;
     return res.status(statusCode).json({
       message: notFound.length > 0
-        ? `${updatedCount} berhasil diperbarui, ${notFound.length} tidak ditemukan`
+        ? `${updatedCount} kehadiran berhasil diperbarui, ${notFound.length} tidak ditemukan`
         : `${updatedCount} data kehadiran berhasil diperbarui`,
       ...(notFound.length > 0 && { notFoundStudentClassIds: notFound }),
     });
   } catch (error) {
     console.error('[attendance/update] Error:', error);
-    return res.status(500).json({ message: 'Gagal memperbarui kehadiran', error: error.message });
+    return res.status(500).json({ message: 'Gagal memperbarui data kehadiran' });
   }
 };
 
-// ── Hapus kehadiran per tanggal ───────────────────────────────────────────────
-
 /**
- * DELETE /teachers/attendances?date=YYYY-MM-DD
- * Menghapus seluruh record kehadiran pada tanggal tertentu untuk kelas ini.
+ * DELETE /teachers/attendances
  *
- * @param {import('express').Request}  req - Query: date (required)
+ * Menghapus seluruh record kehadiran pada tanggal tertentu untuk kelas ini.
+ * [Fix M-06] Validasi format tanggal yang konsisten dengan GET dan PUT.
+ *
+ * @param {import('express').Request} req - Query: { date }
  * @param {import('express').Response} res
  */
 exports.deleteAttendance = async (req, res) => {
   try {
-    const { date }       = req.query;
+    const { date } = req.query;
     const activeSemester = req.activeSemester;
 
-    if (!date) {
-      return res.status(400).json({ message: 'Query parameter "date" wajib diisi' });
+    const validation = validateDateParam(date);
+    if (!validation.valid) {
+      return res.status(400).json({ message: validation.message });
     }
 
     const classData = await getTeacherClass(req.user.id, activeSemester.academic_year_id);
     if (!classData) {
-      return res.status(404).json({ message: 'Kelas tidak ditemukan' });
+      return res.status(404).json({ message: 'Kelas tidak ditemukan untuk wali kelas ini' });
     }
 
     const studentClasses = await StudentClass.findAll({
-      where:      { class_id: classData.id },
+      where: { class_id: classData.id },
       attributes: ['id'],
     });
-    const ids = studentClasses.map((sc) => sc.id);
+
+    if (!studentClasses.length) {
+      return res.status(404).json({ message: 'Tidak ada siswa terdaftar di kelas ini' });
+    }
+
+    const ids = studentClasses.map(sc => sc.id);
 
     const deleted = await Attendance.destroy({
       where: {
         student_class_id: { [Op.in]: ids },
-        semester_id:      activeSemester.id,
+        semester_id: activeSemester.id,
         date,
       },
     });
 
     if (deleted === 0) {
-      return res.status(404).json({ message: 'Tidak ada data kehadiran untuk tanggal tersebut' });
+      return res.status(404).json({
+        message: `Tidak ada data kehadiran untuk tanggal ${date}`,
+      });
     }
 
-    return res.json({ message: `${deleted} data kehadiran berhasil dihapus` });
+    return res.json({
+      message: `${deleted} data kehadiran untuk tanggal ${date} berhasil dihapus`,
+      deleted_count: deleted,
+      date,
+    });
   } catch (error) {
     console.error('[attendance/delete] Error:', error);
-    return res.status(500).json({ message: 'Gagal menghapus kehadiran', error: error.message });
+    return res.status(500).json({ message: 'Gagal menghapus data kehadiran' });
   }
 };

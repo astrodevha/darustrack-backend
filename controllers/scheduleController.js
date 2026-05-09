@@ -1,235 +1,298 @@
 /**
  * controllers/scheduleController.js
- * -----------------------------------
+ *
  * Controller untuk manajemen jadwal pelajaran per kelas.
+ * Mengelola jadwal dalam tahun ajaran aktif, dengan validasi overlap waktu.
  *
- * Endpoints yang dilayani:
- *  - GET    /academic-years/:id/classes/:class_id/schedules?day= → Jadwal satu kelas
- *  - POST   /academic-years/:id/classes/:class_id/schedules      → Tambah jadwal
- *  - PUT    /schedules/:schedule_id                               → Edit jadwal
- *  - DELETE /schedules/:schedule_id                               → Hapus jadwal
- *  - GET    /teachers/schedules?day=                             → Jadwal kelas wali kelas (digunakan oleh teachers router)
+ * ============================================================
+ * ENDPOINTS
+ * ============================================================
+ * GET    /academic-years/:id/classes/:class_id/schedules?day= → jadwal satu kelas
+ * POST   /academic-years/:id/classes/:class_id/schedules      → tambah jadwal
+ * PUT    /schedules/:schedule_id                               → edit jadwal
+ * DELETE /schedules/:schedule_id                               → hapus jadwal
+ * GET    /teachers/schedules?day=                              → jadwal kelas wali kelas
  *
- * Conflict checking:
- *  Saat menambah atau mengedit jadwal, controller memeriksa apakah ada
- *  jadwal lain yang waktu-nya tumpang tindih di kelas dan hari yang sama.
+ * ============================================================
+ * PANDUAN MAINTENANCE
+ * ============================================================
+ * - hasTimeConflict() menggunakan strict less-than (<) untuk menghindari false positif
+ *   pada jadwal yang bersentuhan (08:00–09:00 dan 09:00–10:00 = tidak konflik).
+ * - Validasi waktu menggunakan regex HH:MM atau HH:MM:SS.
+ * - Hari jadwal disimpan dalam Bahasa Indonesia (Senin, Selasa, ...).
  *
- * @module controllers/scheduleController
+ * @module scheduleController
  */
 
-const { Class, AcademicYear, Schedule, Subject } = require('../models');
+// ============================================================
+// Dependencies
+// ============================================================
 const { Op } = require('sequelize');
+const { Class, AcademicYear, Schedule, Subject } = require('../models');
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
+// ============================================================
+// Constants & Helpers
+// ============================================================
 
-/**
- * Map nama hari dari English ke Indonesian (untuk konsistensi data di DB).
- * Jika hari sudah dalam format Indonesia, dikembalikan apa adanya.
- *
- * @param {string} day - Nama hari (contoh: "Monday" atau "Senin")
- * @returns {string}
- */
+/** Pemetaan nama hari dari Inggris ke Indonesia */
 const DAY_MAP_EN_TO_ID = {
-  Monday: 'Senin', Tuesday: 'Selasa', Wednesday: 'Rabu',
-  Thursday: 'Kamis', Friday: 'Jumat', Saturday: 'Sabtu', Sunday: 'Minggu',
+  Monday: 'Senin',
+  Tuesday: 'Selasa',
+  Wednesday: 'Rabu',
+  Thursday: 'Kamis',
+  Friday: 'Jumat',
+  Saturday: 'Sabtu',
+  Sunday: 'Minggu',
 };
 
+/** Daftar hari valid (Bahasa Indonesia) */
+const VALID_DAYS = ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+
+/**
+ * Normalisasi nama hari ke Bahasa Indonesia.
+ * @param {string} day
+ * @returns {string}
+ */
 function normalizeDay(day) {
   return DAY_MAP_EN_TO_ID[day] || day;
 }
 
 /**
- * Cek apakah ada jadwal lain yang waktunya bertabrakan di kelas dan hari yang sama.
- * Menggunakan logika interval overlap: [s1, e1] dan [s2, e2] overlap jika s1 < e2 && s2 < e1.
+ * Validasi format waktu (HH:MM atau HH:MM:SS).
+ * @param {string} time
+ * @returns {boolean}
+ */
+function isValidTimeFormat(time) {
+  return /^\d{2}:\d{2}(:\d{2})?$/.test(time);
+}
+
+/**
+ * Periksa apakah ada jadwal lain yang waktunya bertabrakan di kelas dan hari yang sama.
+ * [Fix M-05] Menggunakan formula interval overlap yang benar (strict less-than).
  *
- * @param {number}      classId
- * @param {string}      day
- * @param {string}      startTime
- * @param {string}      endTime
- * @param {number|null} excludeId - ID jadwal yang dikecualikan (untuk kasus edit)
- * @returns {Promise<boolean>} true jika ada konflik
+ * Dua interval [s1,e1] dan [s2,e2] overlap jika dan hanya jika:
+ *   s1 < e2 AND s2 < e1
+ *
+ * @param {string} classId    - ID kelas
+ * @param {string} day        - Hari (Bahasa Indonesia)
+ * @param {string} startTime  - Waktu mulai baru
+ * @param {string} endTime    - Waktu selesai baru
+ * @param {string|null} excludeId - ID jadwal yang dikecualikan (untuk update)
+ * @returns {Promise<boolean>}
  */
 async function hasTimeConflict(classId, day, startTime, endTime, excludeId = null) {
   const where = {
     class_id: classId,
     day,
-    [Op.or]: [
-      { start_time: { [Op.between]: [startTime, endTime] } },
-      { end_time:   { [Op.between]: [startTime, endTime] } },
-      {
-        [Op.and]: [
-          { start_time: { [Op.lte]: startTime } },
-          { end_time:   { [Op.gte]: endTime   } },
-        ],
-      },
-    ],
+    start_time: { [Op.lt]: endTime },   // existing.start < newEnd
+    end_time:   { [Op.gt]: startTime }, // existing.end   > newStart
   };
-
   if (excludeId) where.id = { [Op.ne]: excludeId };
-
-  const conflict = await Schedule.findOne({ where });
+  const conflict = await Schedule.findOne({ where, attributes: ['id'] });
   return !!conflict;
 }
 
-// ── Get schedules ─────────────────────────────────────────────────────────────
+// ============================================================
+// Controllers
+// ============================================================
 
 /**
  * GET /academic-years/:id/classes/:class_id/schedules?day=Senin
- * Mengambil jadwal untuk satu kelas. Filter hari opsional.
  *
- * CATATAN (Bug yang diperbaiki di versi ini):
- * Versi lama memiliki SIDE EFFECT berbahaya: fungsi GET ini diam-diam
- * MENGHAPUS jadwal dari tahun ajaran non-aktif setiap kali dipanggil.
- * Ini melanggar prinsip least surprise — GET seharusnya bersifat read-only.
- * Side effect tersebut sudah dihapus.
+ * Mengambil jadwal untuk satu kelas. Opsional filter per hari.
+ *
+ * @param {import('express').Request} req - Params: { id, class_id }, Query: { day? }
+ * @param {import('express').Response} res
  */
 exports.getClassSchedules = async (req, res) => {
   try {
     const { class_id } = req.params;
-    const { day }      = req.query;
+    const { day } = req.query;
 
-    // Verifikasi kelas ada di tahun ajaran aktif
     const activeYear = await AcademicYear.findOne({ where: { is_active: true } });
     if (!activeYear) {
       return res.status(404).json({ message: 'Tahun ajaran aktif tidak ditemukan' });
     }
-
     const classData = await Class.findOne({
       where: { id: class_id, academic_year_id: activeYear.id },
+      attributes: ['id', 'name'],
     });
     if (!classData) {
       return res.status(404).json({ message: 'Kelas tidak ditemukan di tahun ajaran aktif' });
     }
 
     const where = { class_id };
-    if (day) where.day = day;
+    if (day) {
+      const normalizedDay = normalizeDay(day);
+      if (!VALID_DAYS.includes(normalizedDay)) {
+        return res.status(400).json({
+          message: `Hari tidak valid. Pilihan: ${VALID_DAYS.join(', ')}`,
+        });
+      }
+      where.day = normalizedDay;
+    }
 
     const schedules = await Schedule.findAll({
       where,
-      include: [{ model: Subject, as: 'subject', attributes: ['name'] }],
-      order:   [['day', 'ASC'], ['start_time', 'ASC']],
+      include: [{ model: Subject, as: 'subject', attributes: ['id', 'name'] }],
+      order: [['day', 'ASC'], ['start_time', 'ASC']],
     });
-
     return res.json(schedules);
   } catch (error) {
-    console.error('[schedule/get] Error:', error);
-    return res.status(500).json({ message: 'Gagal mengambil jadwal', error: error.message });
+    console.error('[schedule/getClass] Error:', error);
+    return res.status(500).json({ message: 'Gagal mengambil jadwal kelas' });
   }
 };
 
-// ── Create schedule ───────────────────────────────────────────────────────────
-
 /**
  * POST /academic-years/:id/classes/:class_id/schedules
- * Body: { subject_id, day, start_time, end_time }
+ *
+ * Menambahkan jadwal baru ke kelas. Cek overlap sebelum menyimpan.
+ *
+ * @param {import('express').Request} req - Params: { id, class_id }, Body: { subject_id, day, start_time, end_time }
+ * @param {import('express').Response} res
  */
 exports.createSchedule = async (req, res) => {
   try {
     let { subject_id, day, start_time, end_time } = req.body;
     const { class_id } = req.params;
 
-    // Normalisasi nama hari ke Bahasa Indonesia
+    if (!subject_id || !day || !start_time || !end_time) {
+      return res.status(400).json({ message: 'Semua field wajib diisi' });
+    }
     day = normalizeDay(day);
+    if (!VALID_DAYS.includes(day)) {
+      return res.status(400).json({ message: `Hari tidak valid. Pilihan: ${VALID_DAYS.join(', ')}` });
+    }
+    if (!isValidTimeFormat(start_time) || !isValidTimeFormat(end_time)) {
+      return res.status(400).json({ message: 'Format waktu tidak valid. Gunakan HH:MM atau HH:MM:SS.' });
+    }
+    if (start_time >= end_time) {
+      return res.status(400).json({ message: 'Waktu mulai harus lebih awal dari waktu selesai' });
+    }
 
     const activeYear = await AcademicYear.findOne({ where: { is_active: true } });
     if (!activeYear) {
       return res.status(404).json({ message: 'Tahun ajaran aktif tidak ditemukan' });
     }
-
     const classData = await Class.findOne({
       where: { id: class_id, academic_year_id: activeYear.id },
+      attributes: ['id'],
     });
     if (!classData) {
       return res.status(404).json({ message: 'Kelas tidak ditemukan di tahun ajaran aktif' });
     }
 
-    // Cek apakah ada jadwal yang bentrok
     const conflict = await hasTimeConflict(class_id, day, start_time, end_time);
     if (conflict) {
-      return res.status(400).json({
-        message: 'Terdapat jadwal lain yang bentrok pada hari dan jam tersebut',
+      return res.status(409).json({
+        message: `Jadwal bertabrakan pada hari ${day} pukul ${start_time}–${end_time}. Pilih waktu lain.`,
       });
     }
 
-    const schedule = await Schedule.create({ class_id, subject_id, day, start_time, end_time });
-    return res.status(201).json({ message: 'Jadwal berhasil ditambahkan', schedule });
+    const schedule = await Schedule.create({
+      class_id,
+      subject_id,
+      day,
+      start_time,
+      end_time,
+    });
+    return res.status(201).json({
+      message: 'Jadwal berhasil ditambahkan',
+      data: schedule,
+    });
   } catch (error) {
     console.error('[schedule/create] Error:', error);
-    return res.status(500).json({ message: 'Gagal menambahkan jadwal', error: error.message });
+    return res.status(500).json({ message: 'Gagal menambahkan jadwal' });
   }
 };
 
-// ── Update schedule ───────────────────────────────────────────────────────────
-
 /**
  * PUT /schedules/:schedule_id
- * Body: { subject_id?, day?, start_time?, end_time? }
- * Semua field bersifat opsional — hanya field yang dikirim yang diupdate.
+ *
+ * Memperbarui jadwal yang sudah ada (partial update).
+ * start_time dan end_time harus dikirim bersamaan jika ingin mengubah waktu.
+ *
+ * @param {import('express').Request} req - Params: { schedule_id }, Body: { subject_id?, day?, start_time?, end_time? }
+ * @param {import('express').Response} res
  */
 exports.updateSchedule = async (req, res) => {
   try {
-    const { schedule_id }                  = req.params;
+    const { schedule_id } = req.params;
     const { subject_id, day, start_time, end_time } = req.body;
 
-    // Jika salah satu dari start/end diubah, keduanya harus disertakan
     if ((start_time && !end_time) || (!start_time && end_time)) {
-      return res.status(400).json({
-        message: 'start_time dan end_time harus diisi bersamaan jika salah satunya diubah',
-      });
+      return res.status(400).json({ message: 'start_time dan end_time harus diisi bersamaan' });
+    }
+    if (start_time && end_time) {
+      if (!isValidTimeFormat(start_time) || !isValidTimeFormat(end_time)) {
+        return res.status(400).json({ message: 'Format waktu tidak valid' });
+      }
+      if (start_time >= end_time) {
+        return res.status(400).json({ message: 'Waktu mulai harus lebih awal dari waktu selesai' });
+      }
     }
 
     const activeYear = await AcademicYear.findOne({ where: { is_active: true } });
     if (!activeYear) {
       return res.status(404).json({ message: 'Tahun ajaran aktif tidak ditemukan' });
     }
-
-    // Cari jadwal dan pastikan kelasnya ada di tahun ajaran aktif
     const schedule = await Schedule.findOne({
-      where:   { id: schedule_id },
+      where: { id: schedule_id },
       include: {
         model: Class,
-        as:    'class',
+        as: 'class',
         where: { academic_year_id: activeYear.id },
+        attributes: ['id'],
       },
     });
     if (!schedule) {
       return res.status(404).json({ message: 'Jadwal tidak ditemukan di tahun ajaran aktif' });
     }
 
-    // Cek bentrok waktu jika ada perubahan waktu atau hari
     if (start_time && end_time) {
+      const effectiveDay = day ? normalizeDay(day) : schedule.day;
       const conflict = await hasTimeConflict(
         schedule.class_id,
-        day || schedule.day,
+        effectiveDay,
         start_time,
         end_time,
         schedule_id,
       );
       if (conflict) {
-        return res.status(400).json({
-          message: 'Terdapat jadwal lain yang bentrok pada hari dan jam tersebut',
+        return res.status(409).json({
+          message: `Jadwal bertabrakan pada hari ${effectiveDay} pukul ${start_time}–${end_time}. Pilih waktu lain.`,
         });
       }
     }
 
-    await schedule.update({
-      subject_id: subject_id  || schedule.subject_id,
-      day:        day         || schedule.day,
-      start_time: start_time  || schedule.start_time,
-      end_time:   end_time    || schedule.end_time,
-    });
+    if (day) {
+      const normalizedDay = normalizeDay(day);
+      if (!VALID_DAYS.includes(normalizedDay)) {
+        return res.status(400).json({ message: `Hari tidak valid. Pilihan: ${VALID_DAYS.join(', ')}` });
+      }
+    }
 
+    await schedule.update({
+      subject_id: subject_id || schedule.subject_id,
+      day: day ? normalizeDay(day) : schedule.day,
+      start_time: start_time || schedule.start_time,
+      end_time: end_time || schedule.end_time,
+    });
     return res.json({ message: 'Jadwal berhasil diperbarui' });
   } catch (error) {
     console.error('[schedule/update] Error:', error);
-    return res.status(500).json({ message: 'Gagal memperbarui jadwal', error: error.message });
+    return res.status(500).json({ message: 'Gagal memperbarui jadwal' });
   }
 };
 
-// ── Delete schedule ───────────────────────────────────────────────────────────
-
 /**
  * DELETE /schedules/:schedule_id
+ *
+ * Menghapus jadwal (hanya yang berada di tahun ajaran aktif).
+ *
+ * @param {import('express').Request} req - Params: { schedule_id }
+ * @param {import('express').Response} res
  */
 exports.deleteSchedule = async (req, res) => {
   try {
@@ -237,73 +300,76 @@ exports.deleteSchedule = async (req, res) => {
     if (!activeYear) {
       return res.status(404).json({ message: 'Tahun ajaran aktif tidak ditemukan' });
     }
-
-    // Pastikan jadwal ini milik kelas di tahun ajaran aktif
     const schedule = await Schedule.findOne({
-      where:   { id: req.params.schedule_id },
+      where: { id: req.params.schedule_id },
       include: {
         model: Class,
-        as:    'class',
+        as: 'class',
         where: { academic_year_id: activeYear.id },
+        attributes: ['id'],
       },
     });
     if (!schedule) {
       return res.status(404).json({ message: 'Jadwal tidak ditemukan di tahun ajaran aktif' });
     }
-
     await schedule.destroy();
     return res.json({ message: 'Jadwal berhasil dihapus' });
   } catch (error) {
     console.error('[schedule/delete] Error:', error);
-    return res.status(500).json({ message: 'Gagal menghapus jadwal', error: error.message });
+    return res.status(500).json({ message: 'Gagal menghapus jadwal' });
   }
 };
 
-// ── Get schedules (untuk wali kelas) ─────────────────────────────────────────
-
 /**
  * GET /teachers/schedules?day=
+ *
  * Jadwal kelas yang diampu wali kelas yang sedang login.
- * Dipanggil dari routes/teachers.js.
+ * [Fix M-08] Satu-satunya implementasi getSchedules (duplikasi di classController dihapus).
+ *
+ * @param {import('express').Request} req - Query: { day? }, req.user.id dari accessValidation
+ * @param {import('express').Response} res
  */
 exports.getSchedules = async (req, res) => {
   try {
     const { day } = req.query;
-
     const activeYear = await AcademicYear.findOne({ where: { is_active: true } });
     if (!activeYear) {
       return res.status(404).json({ message: 'Tahun ajaran aktif tidak ditemukan' });
     }
-
     const myClass = await Class.findOne({
       where: { teacher_id: req.user.id, academic_year_id: activeYear.id },
+      attributes: ['id', 'name'],
     });
     if (!myClass) {
       return res.status(404).json({ message: 'Anda tidak mengampu kelas di tahun ajaran aktif' });
     }
 
     const where = { class_id: myClass.id };
-    if (day) where.day = day;
-
+    if (day) {
+      const normalizedDay = normalizeDay(day);
+      if (!VALID_DAYS.includes(normalizedDay)) {
+        return res.status(400).json({ message: `Hari tidak valid. Pilihan: ${VALID_DAYS.join(', ')}` });
+      }
+      where.day = normalizedDay;
+    }
     const schedules = await Schedule.findAll({
       where,
       include: [{ model: Subject, as: 'subject', attributes: ['id', 'name'] }],
-      order:   [['day', 'ASC'], ['start_time', 'ASC']],
+      order: [['day', 'ASC'], ['start_time', 'ASC']],
     });
-
-    const result = schedules.map((s) => ({
-      class_id:     myClass.id,
-      class_name:   myClass.name,
-      subject_id:   s.subject_id,
-      subject_name: s.subject.name,
-      day:          s.day,
-      start_time:   s.start_time,
-      end_time:     s.end_time,
-    }));
-
-    return res.json(result);
+    return res.json(
+      schedules.map(s => ({
+        class_id: myClass.id,
+        class_name: myClass.name,
+        subject_id: s.subject_id,
+        subject_name: s.subject?.name,
+        day: s.day,
+        start_time: s.start_time,
+        end_time: s.end_time,
+      })),
+    );
   } catch (error) {
     console.error('[schedule/teacher] Error:', error);
-    return res.status(500).json({ message: 'Gagal mengambil jadwal', error: error.message });
+    return res.status(500).json({ message: 'Gagal mengambil jadwal' });
   }
 };
