@@ -120,7 +120,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map((o) => o.trim())
   .filter(Boolean)
-  .concat(['http://localhost:3000', 'https://darustrack.vercel.app']);
+  .concat(['http://localhost:3000', 'https://darustrack.vercel.app/']);
 
 const UNIQUE_ORIGINS = [...new Set(ALLOWED_ORIGINS)];
 
