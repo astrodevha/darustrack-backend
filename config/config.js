@@ -96,11 +96,7 @@ const test = {
  */
 const production = {
   ...baseConfig,
-  username: process.env.DB_USER,
-  password: process.env.DB_PASS || null,
-  database: process.env.DB_NAME,
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
+  database_url: process.env.MYSQL_PUBLIC_URL,
   logging: false,                          // Matikan logging di production
   pool: {                                  // Connection pool untuk efisiensi koneksi
     max: 10,                               // Maksimum koneksi dalam pool
