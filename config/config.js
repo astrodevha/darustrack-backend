@@ -96,14 +96,21 @@ const test = {
  */
 const production = {
   ...baseConfig,
-  database_url: process.env.MYSQL_PUBLIC_URL,
+  use_env_variable: 'MYSQL_PUBLIC_URL', // Gunakan DATABASE_URL jika tersedia, fallback ke variabel terpisah
   logging: false,                          // Matikan logging di production
-  pool: {                                  // Connection pool untuk efisiensi koneksi
-    max: 10,                               // Maksimum koneksi dalam pool
-    min: 0,                                // Minimum koneksi idle
-    acquire: 30000,                        // Timeout acquisi koneksi (ms)
-    idle: 10000,                           // Waktu koneksi idle sebelum ditutup (ms)
+  pool: {
+    max: 5,
+    min: 0,
+    acquire: 30000,
+    idle: 10000
   },
+  dialectOptions: {
+    // Required untuk Railway MySQL
+    ssl: {
+      require: true,
+      rejectUnauthorized: false
+    }
+  }
 };
 
 // ============================================================
