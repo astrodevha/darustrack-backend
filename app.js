@@ -116,28 +116,12 @@ app.set('trust proxy', 1);
  * Bisa dikonfigurasi via environment variable ALLOWED_ORIGINS (comma separated).
  * Default + localhost dan frontend Vercel.
  */
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map((o) => o.trim())
-  .filter(Boolean)
-  .concat(['http://localhost:3000', 'https://darustrack.vercel.app/']);
-
-const UNIQUE_ORIGINS = [...new Set(ALLOWED_ORIGINS)];
-
 const corsOptions = {
-  origin: (origin, callback) => {
-    // Allow requests without origin (Postman, curl)
-    if (!origin || UNIQUE_ORIGINS.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error(`CORS: Origin '${origin}' tidak diizinkan`));
-    }
-  },
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  origin: 'https://darustrack.vercel.app', // Ganti dengan URL Vercel Anda
   credentials: true,
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 };
-
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
