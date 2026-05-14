@@ -117,7 +117,7 @@ app.set('trust proxy', 1);
  * Default + localhost dan frontend Vercel.
  */
 const corsOptions = {
-  origin: 'https://darustrack.vercel.app', // Ganti dengan URL Vercel Anda
+  origin: 'https://darustrack.vercel.app/', // Ganti dengan URL Vercel Anda
   credentials: true,
   methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
